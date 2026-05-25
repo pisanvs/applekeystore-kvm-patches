@@ -1,3 +1,5 @@
+DISCLAIMER: This code was completely designed by Claude. There's probably some edge cases missing, but this fixed my install completely. Please send issues!
+
 # AppleKeyStore KVM Patches
 
 OpenCore kernel patches that fix macOS **Sonoma (14.x)** kernel panics on KVM/QEMU when running without Secure Enclave Processor (SEP) hardware.
