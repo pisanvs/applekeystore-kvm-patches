@@ -2,57 +2,118 @@ DISCLAIMER: This code was completely designed by Claude. There's probably some e
 
 # AppleKeyStore KVM Patches
 
-OpenCore kernel patches that fix macOS **Sonoma (14.x)** and **Sequoia (15.x)** kernel panics on KVM/QEMU when running without Secure Enclave Processor (SEP) hardware.
+Fixes macOS **Sonoma (14.x)** and **Sequoia (15.x)** kernel panics on KVM/QEMU when running without a Secure Enclave Processor (SEP).
+
+**Two approaches** — [Lilu plugin](#option-a--lilu-plugin-recommended) (recommended) or [OpenCore patches](#option-b--opencore-kernel-patches-legacy).
+
+---
 
 ## The Problem
 
-macOS panics at login and again ~82 seconds later with:
+macOS panics within seconds of login:
 
 ```
-panic: "REQUIRE" @ utils.c:1036
+panic: "REQUIRE" @ utils.c:1061
 Kexts in backtrace: com.apple.driver.AppleKeyStore
 ```
 
-**Root cause:** `AppleKeyStore.kext` unconditionally routes authentication through the Secure Enclave Processor (SEP) — even with FileVault *off*. KVM has no SEP, so the `REQUIRE(sep_available())` assertion fires and the kernel panics.
+**Root cause:** `AppleKeyStore.kext` unconditionally calls `_REQUIRE_func` — a SEP availability assertion — in `_compact_bag_unlock` (on login) and `_compact_bag_lock` (on a ~82-second timer). KVM has no SEP, so both assertions fire and the kernel panics.
 
-Two code paths trigger this:
-
-| Function | Trigger | Crash timing |
+| Function | Trigger | Timing |
 |---|---|---|
 | `_compact_bag_unlock` | Password authentication | Immediately at login |
 | `_compact_bag_lock` | Periodic lock timer | ~82 seconds after boot |
 
-## The Fix
+---
 
-Two OpenCore `Kernel → Patch` entries that NOP the REQUIRE call in each function, letting execution continue past the SEP guard.
+## Compatibility
 
-### Compatibility
-
-| macOS | Darwin | Build tested | Status |
+| macOS | Darwin | Build | Status |
 |---|---|---|---|
 | Sonoma 14.8.7 | 23.x | xnu-10063.141.1.712.16~1 | ✅ Tested |
-| Sequoia 15.7.7 | 24.x | xnu-11215.x (24G720) | ✅ Tested |
+| Sequoia 15.7.7 | 24.x | xnu-11417.140.69.710.16~1 (24G720) | ✅ Tested — 2h+ uptime |
 
-## Applying the Patches
+---
 
-> **Shortcut:** Copy this prompt and paste it into [Claude Code](https://claude.ai/code) or a similar AI coding assistant — it will read this README and apply the patches to your install automatically:
->
-> ```
-> Read https://github.com/pisanvs/applekeystore-kvm-patches/blob/main/README.md and apply the appropriate patches to my OpenCore config.plist to fix AppleKeyStore KVM panics on my macOS install.
-> ```
+## Option A — Lilu Plugin (Recommended)
 
-### Option A — Automatic (recommended)
+A [Lilu](https://github.com/acidanthera/Lilu) kernel extension that resolves `_REQUIRE_func` by symbol at boot and overwrites it with `xor eax, eax; ret`. This:
+
+- **Covers all call sites at once** — any current or future code path in the kext that hits `_REQUIRE_func` is neutralised
+- **Survives kernel updates** — uses Lilu's live symbol resolver, not hardcoded byte offsets
+- **Verifiable from inside the OS** — check with `sudo dmesg | grep kvmaks` after boot
+- **Proven stable** — 2h+ uptime on Sequoia 15.7.7 with Chrome Remote Desktop and general use
+
+### Prerequisites
+
+- [Lilu.kext](https://github.com/acidanthera/Lilu/releases) ≥ 1.6.0 already in your OC Kexts (almost certainly yes if you have a working Hackintosh)
+- Xcode or Xcode CLT on a macOS machine to build (can be the VM itself)
+
+### Build
 
 ```bash
-# Mount your OpenCore EFI partition first (e.g. at /mnt/opencore)
-sudo python3 scripts/apply_patches.py --plist /mnt/opencore/EFI/OC/config.plist
+# 1. Get Lilu source + MacKernelSDK (one-time setup on your macOS machine/VM)
+mkdir -p ~/lilu-build && cd ~/lilu-build
+git clone --depth 1 https://github.com/acidanthera/Lilu.git
+cd Lilu && git clone --depth 1 https://github.com/acidanthera/MacKernelSDK.git
+
+# 2. Build the plugin
+cd /path/to/this/repo/KvmAKSFix
+chmod +x build.sh && ./build.sh
+# → produces build/KvmAKSFix.kext
 ```
 
-This adds all patches for all supported macOS versions. Each patch is gated by `MinKernel`/`MaxKernel` so only the right one applies at boot.
+### Install
 
-### Option B — Manual (XML)
+```bash
+# Copy kext to OC (mount your OC EFI partition first)
+sudo cp -r build/KvmAKSFix.kext /path/to/EFI/OC/Kexts/
+```
 
-Add these entries to the `Kernel → Patch` array in your `config.plist`:
+Add to `config.plist` → `Kernel → Add`:
+
+```xml
+<dict>
+    <key>Arch</key><string>Any</string>
+    <key>BundlePath</key><string>KvmAKSFix.kext</string>
+    <key>Comment</key><string>AppleKeyStore SEP REQUIRE neuterer for KVM</string>
+    <key>Enabled</key><true/>
+    <key>ExecutablePath</key><string>Contents/MacOS/KvmAKSFix</string>
+    <key>MaxKernel</key><string></string>
+    <key>MinKernel</key><string>20.0.0</string>
+    <key>PlistPath</key><string>Contents/Info.plist</string>
+</dict>
+```
+
+> **Important:** KvmAKSFix must load **after** Lilu. In OC's Kext list, ensure Lilu appears before KvmAKSFix.
+
+### Verify
+
+After booting:
+
+```bash
+sudo dmesg | grep kvmaks
+# Expected output:
+# kvmaks: start (build May 27 2026 ...)
+# kvmaks: resolved _REQUIRE_func @ 0xffffff80...
+# kvmaks: patched _REQUIRE_func @ 0xffffff80... → xor eax,eax; ret
+```
+
+If you see all three lines, the patch is live and every REQUIRE site in AppleKeyStore is neutralised.
+
+---
+
+## Option B — OpenCore Kernel Patches (Legacy)
+
+> Use this if you can't build the Lilu plugin. These patches use hardcoded byte patterns that may need updating after macOS kernel rebuilds.
+
+### Automatic
+
+```bash
+sudo python3 scripts/apply_patches.py --plist /path/to/EFI/OC/config.plist
+```
+
+### Manual (XML)
 
 #### Sonoma 14.x
 
@@ -97,7 +158,7 @@ Add these entries to the `Kernel → Patch` array in your `config.plist`:
 #### Sequoia 15.x
 
 ```xml
-<!-- _compact_bag_lock (start crash + timer crash) -->
+<!-- _compact_bag_lock -->
 <dict>
     <key>Arch</key><string>x86_64</string>
     <key>Base</key><string></string>
@@ -105,7 +166,7 @@ Add these entries to the `Kernel → Patch` array in your `config.plist`:
     <key>Count</key><integer>1</integer>
     <key>Enabled</key><true/>
     <key>Find</key><data>vk8LAADoJI37/w==</data>
-    <key>Identifier</key><string>com.apple.driver.AppleKeyStore</string>
+    <key>Identifier</key><string>kernel</string>
     <key>Limit</key><integer>0</integer>
     <key>Mask</key><data></data>
     <key>MaxKernel</key><string>24.9.9</string>
@@ -123,7 +184,7 @@ Add these entries to the `Kernel → Patch` array in your `config.plist`:
     <key>Count</key><integer>1</integer>
     <key>Enabled</key><true/>
     <key>Find</key><data>vu8KAADo2oP7/w==</data>
-    <key>Identifier</key><string>com.apple.driver.AppleKeyStore</string>
+    <key>Identifier</key><string>kernel</string>
     <key>Limit</key><integer>0</integer>
     <key>Mask</key><data></data>
     <key>MaxKernel</key><string>24.9.9</string>
@@ -143,39 +204,61 @@ Add these entries to the `Kernel → Patch` array in your `config.plist`:
 | Sequoia | `_compact_bag_lock` | `be4f0b0000e8248dfbff` | `be4f0b00009090909090` |
 | Sequoia | `_compact_bag_unlock` | `beef0a0000e8da83fbff` | `beef0a00009090909090` |
 
-## How It Works
+### Updating after a macOS kernel rebuild
 
-OpenCore applies these patches to `AppleKeyStore.kext` in memory at boot before the kernel loads it. Each patch replaces a 5-byte `call` instruction (the REQUIRE panic handler) with 5 `NOP` instructions, skipping the assertion without affecting the rest of the function.
-
-```
-Before:  be 4f 0b 00 00   mov esi, <line_number>
-         e8 24 8d fb ff   call _REQUIRE_func   ← panics if no SEP
-After:   be 4f 0b 00 00   mov esi, <line_number>
-         90 90 90 90 90   nop nop nop nop nop  ← skipped
-```
-
-## Finding New Offsets
-
-If your kernel version isn't listed above, use `find_patches.py` to generate the correct bytes automatically:
+If the OC patches stop working after a macOS update, use `find_patches.py` to re-derive the correct bytes:
 
 ```bash
-# Copy BootKernelExtensions.kc from recovery or a running VM:
-# scp user@<vm>:/System/Volumes/Preboot/<UUID>/boot/System/Library/KernelCollections/BootKernelExtensions.kc .
+# Copy KC from recovery or a running VM:
+# scp user@<vm>:'/System/Volumes/Preboot/<UUID>/boot/System/Library/KernelCollections/BootKernelExtensions.kc' .
 
 python3 scripts/find_patches.py BootKernelExtensions.kc
 ```
 
 Requires `llvm-nm`: `pacman -S llvm` / `brew install llvm`
 
+---
+
+## How It Works
+
+```
+Before:  be ef 0a 00 00   mov esi, <line_number>   ; _compact_bag_unlock + 0x3a
+         e8 da 83 fb ff   call _REQUIRE_func        ← panics if no SEP
+
+After (Lilu):  _REQUIRE_func prologue becomes:
+         31 c0            xor eax, eax              ← return 0 immediately
+         c3               ret
+         90 90            nop nop
+
+After (OC):    call site becomes:
+         90 90 90 90 90   nop nop nop nop nop       ← call skipped
+```
+
+The Lilu approach patches the function itself once; the OC approach patches each call site individually and needs updating when kernel bytes change.
+
+---
+
+## AI Assistant Shortcut
+
+Copy this prompt into [Claude Code](https://claude.ai/code) or a similar AI assistant:
+
+```
+Read https://github.com/pisanvs/applekeystore-kvm-patches/blob/main/README.md and apply the appropriate patches to fix AppleKeyStore KVM panics on my macOS install. Prefer the Lilu plugin approach if I have Xcode or CLT available.
+```
+
+---
+
 ## Environment
 
 Tested on:
-- Host: Arch Linux, QEMU 11.0.0, libvirt/virsh, KVM (Intel i5-11400 / Rocket Lake)
-- Guest: macOS Sonoma 14.8.7, macOS Sequoia 15.7.7
-- Bootloader: OpenCore 1.0.6 (from [kholia/OSX-KVM](https://github.com/kholia/OSX-KVM))
+- **Host:** Arch Linux, QEMU 11.0.0, libvirt/virsh, KVM (Intel i5-11400 / Rocket Lake)
+- **Guest:** macOS Sonoma 14.8.7, macOS Sequoia 15.7.7
+- **Bootloader:** OpenCore 1.0.6 (from [kholia/OSX-KVM](https://github.com/kholia/OSX-KVM))
 - No SEP, no FileVault
 
 ## References
 
 - [kholia/OSX-KVM](https://github.com/kholia/OSX-KVM) — the KVM macOS project this was developed against
+- [acidanthera/Lilu](https://github.com/acidanthera/Lilu) — kernel patcher kext used by this plugin
+- [acidanthera/MacKernelSDK](https://github.com/acidanthera/MacKernelSDK) — kernel SDK for building Lilu plugins
 - OpenCore [Kernel Patch documentation](https://dortania.github.io/OpenCore-Install-Guide/config.plist/haswell.html#kernel)
